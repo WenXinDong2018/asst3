@@ -27,36 +27,6 @@ static inline int nextPow2(int n) {
     return n;
 }
 
-__global__ void 
-upsweep(int* result, int two_d, int N ) {
-    // parallel_for (int i = 0; i < N; i += two_dplus1) { // 0, 2, 4, ...
-    //     output[i+two_dplus1-1] += output[i+two_d-1];
-    // }
-    int two_dplus1 = 2 * two_d; // 2, 4, 8, ..., N
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) * two_dplus1; // 0, 2, 4, ...
-    if (i + two_dplus1 - 1 < N) {
-        result[i + two_dplus1 - 1] += result[i + two_d - 1];
-    }
-}
-
-__global__ void 
-downsweep(int* result, int two_d, int N ) {  // N/2, N/4, ..., 1
-    // parallel_for (int i = 0; i < N; i += two_dplus1) { // 0, 2, 4, ...
-    //     int t = output[i+two_d-1]; 
-    //     output[i+two_d-1] = output[i+two_dplus1-1];
-    //     output[i+two_dplus1-1] += t;
-    // }
-    int two_dplus1 = 2 * two_d; // N, N/2, ..., 2
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) * two_dplus1; // 0; 0, N/2; 
-    if (i + two_dplus1 - 1 >= N) return;
-    if (two_d == N/2){
-        result[N-1] = 0;
-    }
-    int t = result[i+two_d-1];
-    result[i+two_d-1] = result[i+two_dplus1-1];
-    result[i+two_dplus1-1] += t;
-}
-
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -65,44 +35,153 @@ downsweep(int* result, int two_d, int N ) {  // N/2, N/4, ..., 1
 // N is the logical size of the input and output arrays, however
 // students can assume that both the start and result arrays we
 // allocated with next power-of-two sizes as described by the comments
-// in cudaScan().  This is helpful, since your parallel scan
+// in cudaScan(). This is helpful, since your parallel scan
 // will likely write to memory locations beyond N, but of course not
 // greater than N rounded up to the next power of 2.
 //
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
-void exclusive_scan(int* input, int N, int* result)
-{
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+__global__ void block_level_scan(int* output, int N, int powN, int* blockSums) { 
+    __shared__ int partial_sum[THREADS_PER_BLOCK]; 
+    int local_idx = threadIdx.x; 
+    int block_begin = blockIdx.x * blockDim.x; 
+    int true_idx = block_begin + local_idx; 
 
-    N = nextPow2(N);
-    // upsweep phase 
-    for (int two_d = 1; two_d <= N/2; two_d*=2) { // 1, 2, 4, ..., N/2 
-        int two_dplus1 = 2*two_d; // 2, 4, 8, ..., N
-        int n_threads = N / two_dplus1; // N/2, N/4, ..., 1
-        int n_threads_per_block = min(n_threads, THREADS_PER_BLOCK);
-        int n_blocks = (n_threads + n_threads_per_block - 1) / n_threads_per_block;
-        upsweep<<<n_blocks, n_threads_per_block >>>(result, two_d, N);
+    int validThreads = min(blockDim.x, powN - block_begin); 
+
+    if (true_idx >= powN) return; 
+
+    if (true_idx < N) {
+        partial_sum[local_idx] = output[true_idx]; 
+    }
+    else {
+        partial_sum[local_idx] = 0; 
+    }
+    __syncthreads();
+
+    if (blockSums) {
+        blockSums[blockIdx.x] = 0; 
     }
     
+    // upsweep phase 
+    for (int two_d = 1; two_d <= validThreads/2; two_d*=2) { 
+        int two_dplus1 = 2*two_d; 
+        int idx = (local_idx + 1) * two_dplus1 - 1; 
+        if (idx < validThreads) 
+            partial_sum[idx] += partial_sum[idx - two_d]; 
+        __syncthreads(); 
+    }
+    
+    if (local_idx == validThreads - 1) {
+        if (blockSums) {
+            blockSums[blockIdx.x] = partial_sum[local_idx]; 
+        }
+        partial_sum[local_idx] = 0; 
+    }
+
+    __syncthreads(); 
+    
+    // downsweep phase 
+    for (int two_d = validThreads/2; two_d >= 1; two_d /= 2) { 
+        int two_dplus1 = 2*two_d; 
+        int idx = (local_idx + 1) * two_dplus1 - 1; 
+        if (idx < validThreads) { 
+            int t = partial_sum[idx-two_d]; 
+            partial_sum[idx-two_d] = partial_sum[idx]; 
+            partial_sum[idx] += t; 
+        } 
+        __syncthreads(); 
+    } 
+    if(true_idx < N) 
+        output[true_idx] = partial_sum[local_idx]; 
+}
+
+__global__ void sum_scan(int* output, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+   
+    if (i >= N) return; 
+
+    // upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        int k = (i + 1) * two_dplus1 - 1; 
+        if (k < N)
+            output[k] += output[k - two_d];
+        __syncthreads(); 
+    }
+ 
+    
+    if(i == 0) {
+        output[N-1] = 0; 
+    }
+    __syncthreads(); 
+
     // downsweep phase
-    for (int two_d = N/2; two_d >= 1; two_d /= 2) { // N/2, N/4, ..., 1
-        int n_threads = N / (2*two_d); // 1, 2, ..., N/2
-        int n_threads_per_block = min(n_threads, THREADS_PER_BLOCK);
-        int n_blocks = (n_threads + n_threads_per_block - 1) / n_threads_per_block;
-        downsweep<<<n_blocks, n_threads_per_block >>>(result, two_d, N);
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d; 
+        int k = (i + 1) * two_dplus1 - 1; 
+        if (k < N) {
+            int t = output[k-two_d];
+            output[k-two_d] = output[k];
+            output[k] += t;
+        }
+         __syncthreads(); 
     }
 }
 
+__global__ void coalesce_sums(int * output, int n, int* blockSums) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (idx < n)
+        output[idx] += blockSums[blockIdx.x]; 
+}
+
+void recursive_block_scan(int* results, int N) {
+
+    const int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    
+    if (blocks == 1) {
+        int powN = nextPow2(N); 
+        block_level_scan<<<1, powN>>>(results, N, powN, nullptr);
+        cudaDeviceSynchronize();
+        return;
+    }
+    
+    int* blockSums;
+    int powBlocks = nextPow2(blocks); //pad up to 64 blockSums
+    cudaMalloc(&blockSums, powBlocks * sizeof(int));
+    if (blocks < powBlocks) {
+        cudaMemset(blockSums + blocks, 0, (powBlocks - blocks) * sizeof(int));
+    }
+
+    int remainder = N & (THREADS_PER_BLOCK-1); 
+    int paddedN = (remainder == 0) ? N : (N - remainder + nextPow2(remainder));
+
+    block_level_scan<<<blocks, THREADS_PER_BLOCK>>>(results, N, paddedN, blockSums); 
+
+    cudaDeviceSynchronize();
+
+    int temp[powBlocks]; 
+    
+    recursive_block_scan(blockSums, blocks);
+
+    cudaMemcpy(temp, blockSums, powBlocks * sizeof(int), cudaMemcpyDeviceToHost);
+
+    coalesce_sums<<<blocks, THREADS_PER_BLOCK>>>(results, N, blockSums);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(temp, blockSums, powBlocks * sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(blockSums);
+}
+
+void exclusive_scan(int* input, int N, int* result)
+{
+    recursive_block_scan(result, N); 
+}
 
 //
 // cudaScan --
@@ -125,7 +204,7 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     // allocated length is a power of 2 for simplicity. This will
     // result in extra work on non-power-of-2 inputs, but it's worth
     // the simplicity of a power of two only solution.
-
+    //for(int i = 0; i < N; i++){printf("original: %d\n", inarray[i]);}
     int rounded_length = nextPow2(end - inarray);
     
     cudaMalloc((void **)&device_result, sizeof(int) * rounded_length);
@@ -134,7 +213,7 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     // For convenience, both the input and output vectors on the
     // device are initialized to the input values. This means that
     // students are free to implement an in-place scan on the result
-    // vector if desired.  If you do this, you will need to keep this
+    // vector if desired. If you do this, you will need to keep this
     // in mind when calling exclusive_scan from find_repeats.
     cudaMemcpy(device_input, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice);
@@ -187,33 +266,35 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
-__global__ void
-create_bool_array(int* input, int* bools, int length) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index + 1 >= length) return;
-    if (input[index] == input[index + 1]) {
-        bools[index] = 1;
-    } else {
-        bools[index] = 0;
-    }
-}
-
-__global__ void 
-scatter(int* device_input, int* scan_result, int* output, int length) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index + 1 >= length) return;
-    if (device_input[index] == device_input[index + 1]) {
-        int output_index = scan_result[index];
-        output[output_index] = index;
-    }
-}
-
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
+
+__global__ void repeat_pairs(int* input, int* flag, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (i >= N-1) return;
+    
+    if (input[i] == input[i+1]) {
+        flag[i] = 1; 
+    }
+    else {
+        flag[i] = 0;
+    }
+}
+__global__ void get_indices(int* input, int* prefix_sums, int* output, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (i >= N-1) return;
+
+    if (input[i] != input[i+1]) return;
+
+    output[prefix_sums[i]] = i;
+}
+
 int find_repeats(int* device_input, int length, int* device_output) {
 
     // CS149 TODO:
@@ -227,31 +308,27 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
-    int length_pow2 = nextPow2(length);
-    int n_threads = length_pow2;
-    int n_threads_per_block = min(n_threads, THREADS_PER_BLOCK);
-    int num_blocks = (n_threads + n_threads_per_block - 1) / n_threads_per_block;
+    int* flags;
+    int rounded_length = nextPow2(length); 
+    int cnt; 
+
+    cudaMalloc((void **)&flags, sizeof(int) * rounded_length);
+
+    int active_threads = length; 
+    int threadsPerBlock = min(rounded_length, THREADS_PER_BLOCK);
+    int blocks = (active_threads + threadsPerBlock - 1) / threadsPerBlock;
     
-    int* bools;
-    cudaMalloc((void **)&bools, sizeof(int) * length_pow2);
+    repeat_pairs<<<blocks,threadsPerBlock>>>(device_input, flags, length); 
 
-    create_bool_array<<<num_blocks, n_threads_per_block>>>(device_input, bools, length);
+    exclusive_scan(flags, length, flags);
 
-    int last_val, last_flag;
-    cudaMemcpy(&last_flag, bools + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
-
-    exclusive_scan(bools, length, bools);
-
-    scatter<<<num_blocks, n_threads_per_block>>>(device_input, bools, device_output, length);
-
-    cudaMemcpy(&last_val, bools + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
-
-    if (last_flag == 1) {
-        last_val += 1;
-    }
+    get_indices<<<blocks,threadsPerBlock>>>(device_input, flags, device_output, length); 
     
-    cudaFree(bools);
-    return last_val;
+    cudaMemcpy(&cnt, flags + (length - 1), sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(flags);
+
+    return cnt; 
 }
 
 
@@ -303,40 +380,22 @@ void printCudaInfo()
         cudaDeviceProp deviceProps;
         cudaGetDeviceProperties(&deviceProps, i);
         printf("Device %d: %s\n", i, deviceProps.name);
-        printf("   SMs:        %d\n", deviceProps.multiProcessorCount);
-        printf("   Global mem: %.0f MB\n",
+        printf(" SMs: %d\n", deviceProps.multiProcessorCount);
+        printf(" Global mem: %.0f MB\n",
                static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024));
-        printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
+        printf(" CUDA Cap: %d.%d\n", deviceProps.major, deviceProps.minor);
     }
     printf("---------------------------------------------------------\n"); 
 }
 
 
-// -------------------------
-// Scan Score Table:
-// -------------------------
 // -------------------------------------------------------------------------
 // | Element Count   | Ref Time        | Student Time    | Score           |
 // -------------------------------------------------------------------------
-// | 1000000         | 0.65            | 0.418           | 1.25            |
-// | 10000000        | 8.95            | 7.669           | 1.25            |
-// | 20000000        | 17.669          | 15.404          | 1.25            |
-// | 40000000        | 34.62           | 30.934          | 1.25            |
-// -------------------------------------------------------------------------
-// |                                   | Total score:    | 5.0/5.0         |
-// -------------------------------------------------------------------------
-
-
-// -------------------------
-// Find_repeats Score Table:
-// -------------------------
-// -------------------------------------------------------------------------
-// | Element Count   | Ref Time        | Student Time    | Score           |
-// -------------------------------------------------------------------------
-// | 1000000         | 1.204           | 0.665           | 1.25            |
-// | 10000000        | 13.071          | 8.807           | 1.25            |
-// | 20000000        | 21.348          | 17.765          | 1.25            |
-// | 40000000        | 42.521          | 34.79           | 1.25            |
+// | 1000000         | 1.247           | 0.764           | 1.25            |
+// | 10000000        | 13.114          | 3.367           | 1.25            |
+// | 20000000        | 21.327          | 9.239           | 1.25            |
+// | 40000000        | 42.051          | 11.447          | 1.25            |
 // -------------------------------------------------------------------------
 // |                                   | Total score:    | 5.0/5.0         |
 // -------------------------------------------------------------------------
