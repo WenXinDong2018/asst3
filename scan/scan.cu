@@ -27,6 +27,36 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void 
+upsweep(int* result, int two_d, int N ) {
+    // parallel_for (int i = 0; i < N; i += two_dplus1) { // 0, 2, 4, ...
+    //     output[i+two_dplus1-1] += output[i+two_d-1];
+    // }
+    int two_dplus1 = 2 * two_d; // 2, 4, 8, ..., N
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * two_dplus1; // 0, 2, 4, ...
+    if (i + two_dplus1 - 1 < N) {
+        result[i + two_dplus1 - 1] += result[i + two_d - 1];
+    }
+}
+
+__global__ void 
+downsweep(int* result, int two_d, int N ) {  // N/2, N/4, ..., 1
+    // parallel_for (int i = 0; i < N; i += two_dplus1) { // 0, 2, 4, ...
+    //     int t = output[i+two_d-1]; 
+    //     output[i+two_d-1] = output[i+two_dplus1-1];
+    //     output[i+two_dplus1-1] += t;
+    // }
+    int two_dplus1 = 2 * two_d; // N, N/2, ..., 2
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * two_dplus1; // 0; 0, N/2; 
+    if (i + two_dplus1 - 1 >= N) return;
+    if (two_d == N/2){
+        result[N-1] = 0;
+    }
+    int t = result[i+two_d-1];
+    result[i+two_d-1] = result[i+two_dplus1-1];
+    result[i+two_dplus1-1] += t;
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -54,7 +84,23 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
-
+    N = nextPow2(N);
+    // upsweep phase 
+    for (int two_d = 1; two_d <= N/2; two_d*=2) { // 1, 2, 4, ..., N/2 
+        int two_dplus1 = 2*two_d; // 2, 4, 8, ..., N
+        int n_threads = N / two_dplus1; // N/2, N/4, ..., 1
+        int n_threads_per_block = min(n_threads, THREADS_PER_BLOCK);
+        int n_blocks = (n_threads + n_threads_per_block - 1) / n_threads_per_block;
+        upsweep<<<n_blocks, n_threads_per_block >>>(result, two_d, N);
+    }
+    
+    // downsweep phase
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) { // N/2, N/4, ..., 1
+        int n_threads = N / (2*two_d); // 1, 2, ..., N/2
+        int n_threads_per_block = min(n_threads, THREADS_PER_BLOCK);
+        int n_blocks = (n_threads + n_threads_per_block - 1) / n_threads_per_block;
+        downsweep<<<n_blocks, n_threads_per_block >>>(result, two_d, N);
+    }
 }
 
 
@@ -141,6 +187,27 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void
+create_bool_array(int* input, int* bools, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index + 1 >= length) return;
+    if (input[index] == input[index + 1]) {
+        bools[index] = 1;
+    } else {
+        bools[index] = 0;
+    }
+}
+
+__global__ void 
+scatter(int* device_input, int* scan_result, int* output, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index + 1 >= length) return;
+    if (device_input[index] == device_input[index + 1]) {
+        int output_index = scan_result[index];
+        output[output_index] = index;
+    }
+}
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -160,8 +227,31 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int length_pow2 = nextPow2(length);
+    int n_threads = length_pow2;
+    int n_threads_per_block = min(n_threads, THREADS_PER_BLOCK);
+    int num_blocks = (n_threads + n_threads_per_block - 1) / n_threads_per_block;
+    
+    int* bools;
+    cudaMalloc((void **)&bools, sizeof(int) * length_pow2);
 
-    return 0; 
+    create_bool_array<<<num_blocks, n_threads_per_block>>>(device_input, bools, length);
+
+    int last_val, last_flag;
+    cudaMemcpy(&last_flag, bools + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    exclusive_scan(bools, length, bools);
+
+    scatter<<<num_blocks, n_threads_per_block>>>(device_input, bools, device_output, length);
+
+    cudaMemcpy(&last_val, bools + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (last_flag == 1) {
+        last_val += 1;
+    }
+    
+    cudaFree(bools);
+    return last_val;
 }
 
 
@@ -220,3 +310,33 @@ void printCudaInfo()
     }
     printf("---------------------------------------------------------\n"); 
 }
+
+
+// -------------------------
+// Scan Score Table:
+// -------------------------
+// -------------------------------------------------------------------------
+// | Element Count   | Ref Time        | Student Time    | Score           |
+// -------------------------------------------------------------------------
+// | 1000000         | 0.65            | 0.418           | 1.25            |
+// | 10000000        | 8.95            | 7.669           | 1.25            |
+// | 20000000        | 17.669          | 15.404          | 1.25            |
+// | 40000000        | 34.62           | 30.934          | 1.25            |
+// -------------------------------------------------------------------------
+// |                                   | Total score:    | 5.0/5.0         |
+// -------------------------------------------------------------------------
+
+
+// -------------------------
+// Find_repeats Score Table:
+// -------------------------
+// -------------------------------------------------------------------------
+// | Element Count   | Ref Time        | Student Time    | Score           |
+// -------------------------------------------------------------------------
+// | 1000000         | 1.204           | 0.665           | 1.25            |
+// | 10000000        | 13.071          | 8.807           | 1.25            |
+// | 20000000        | 21.348          | 17.765          | 1.25            |
+// | 40000000        | 42.521          | 34.79           | 1.25            |
+// -------------------------------------------------------------------------
+// |                                   | Total score:    | 5.0/5.0         |
+// -------------------------------------------------------------------------
