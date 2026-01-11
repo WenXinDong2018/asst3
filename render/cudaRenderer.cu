@@ -14,6 +14,12 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+
+#define SCAN_BLOCK_DIM   256  // needed by sharedMemExclusiveScan implementation
+#define MAX_CIRCLES_PER_BLOCK 4096
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -319,7 +325,7 @@ __global__ void kernelAdvanceSnowflake() {
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
 shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
+    
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
@@ -425,6 +431,123 @@ __global__ void kernelRenderCircles() {
             imgPtr++;
         }
     }
+}
+
+__device__ __inline__ int populateCircleList(int linearThreadIndex, int c, int numCircles, float blockMinX, float blockMaxX, float blockMinY, float blockMaxY, uint* prefixSumInput, uint* prefixSumOutput, uint* prefixSumScratch, uint* circleList, int& numCirclesInList){
+    int circleIndex = linearThreadIndex + c;
+    // 1. Populate circle-in-box flag
+    int is_in_box = 0;
+    if (circleIndex < numCircles){
+        int index3 = 3 * circleIndex;
+        float rad = cuConstRendererParams.radius[circleIndex];
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        is_in_box = circleInBox(p.x, p.y, rad, blockMinX, blockMaxX, blockMaxY, blockMinY);  
+    }
+    prefixSumInput[linearThreadIndex] = is_in_box;
+    __syncthreads();
+
+    // 2. Call exclusive scan to compute prefix sum 
+    // E.g. Input:  {1, 0, 0, 1, 1, 0, 0, 0, 0, 0}
+    //.     Output: {0, 1, 1, 1, 2, 3, 3, 3, 3, 3}
+    sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+    __syncthreads();
+
+    // 3. Scatter 
+    if (is_in_box) {
+        int output_index = prefixSumOutput[linearThreadIndex];
+        circleList[numCirclesInList + output_index] = circleIndex;
+    }
+
+    if (linearThreadIndex == 0){
+        numCirclesInList += prefixSumOutput[SCAN_BLOCK_DIM - 1];
+    }
+    __syncthreads(); 
+
+    if (numCirclesInList + SCAN_BLOCK_DIM > MAX_CIRCLES_PER_BLOCK) {
+        // should flush now 
+        return 1;
+    }
+    return 0;
+
+}
+
+__device__ __inline__ void renderPixel(int pixelX, int pixelY, int numCirclesInList, uint* circleList){
+    
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                    invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+    // For circles inside the box, 
+    for (int i = 0; i < numCirclesInList; i++) {
+        int index = circleList[i];
+        int index3 = 3 * index;
+
+        // read position and radius
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        
+        shadePixel(index, pixelCenterNorm, p, imgPtr);
+    }
+}
+
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread renders a pixel.  
+__global__ void kernelRenderPixels() {
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;    
+    int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
+    int numCircles = cuConstRendererParams.numCircles;
+    
+    // SCAN_BLOCK_DIM = total number of threads. 
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+    __shared__ uint circleList[MAX_CIRCLES_PER_BLOCK];
+    __shared__ int numCirclesInList;
+
+    if (linearThreadIndex == 0) {
+        numCirclesInList = 0;
+    }
+    __syncthreads();
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float blockMinX = blockIdx.x * blockDim.x * invWidth;
+    float blockMaxX = (blockIdx.x + 1) * blockDim.x * invWidth;
+    float blockMinY = blockIdx.y * blockDim.y * invHeight;
+    float blockMaxY = (blockIdx.y + 1) * blockDim.y * invHeight;
+        
+    for (int c = 0; c < numCircles; c += SCAN_BLOCK_DIM){
+        // All threads collaboratively find circle candidates
+        int shouldFlush = populateCircleList(linearThreadIndex, c, numCircles, blockMinX, blockMaxX, blockMinY, blockMaxY, prefixSumInput, prefixSumOutput, prefixSumScratch, circleList, numCirclesInList);
+
+        // Need to process existing circles first, before finding more candidates. 
+        if (shouldFlush && x < cuConstRendererParams.imageWidth && y < cuConstRendererParams.imageHeight){
+            renderPixel(x, y, numCirclesInList, circleList);
+        }
+        
+        // Last thread should empty out the circle list
+        if (shouldFlush && linearThreadIndex == 0){
+            numCirclesInList = 0;
+        }
+        __syncthreads();
+    }
+
+    // Render remaining circles after loop ends
+    if (numCirclesInList>0 and x < cuConstRendererParams.imageWidth and y < cuConstRendererParams.imageHeight){
+        renderPixel(x, y, numCirclesInList, circleList);
+    }
+    __syncthreads();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -616,7 +739,7 @@ CudaRenderer::clearImage() {
 // and velocities
 void
 CudaRenderer::advanceAnimation() {
-     // 256 threads per block is a healthy number
+    // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
@@ -637,9 +760,70 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(16, 16);  // 256 threads per block
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y
+    );
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
+
+
+// Running scene: rgb...
+// [rgb] Correctness passed!
+// [rgb] Student times:  [0.2614, 0.2656, 0.298]
+// [rgb] Reference times:  [0.2819, 0.2849, 0.2714]
+
+// Running scene: rand10k...
+// [rand10k] Correctness failed ... Check ./logs/correctness_rand10k.log
+// [rand10k] Student times:  [5.673, 7.5347, 8.9614]
+// [rand10k] Reference times:  [5.4061, 5.4147, 6.2117]
+
+// Running scene: rand100k...
+// [rand100k] Correctness failed ... Check ./logs/correctness_rand100k.log
+// [rand100k] Student times:  [73.235, 62.6043, 66.2576]
+// [rand100k] Reference times:  [32.0438, 32.0322, 47.8154]
+
+// Running scene: pattern...
+// [pattern] Correctness failed ... Check ./logs/correctness_pattern.log
+// [pattern] Student times:  [0.8619, 0.7869, 0.7782]
+// [pattern] Reference times:  [0.6832, 0.5116, 0.4826]
+
+// Running scene: snowsingle...
+// [snowsingle] Correctness failed ... Check ./logs/correctness_snowsingle.log
+// [snowsingle] Student times:  [58.4077, 55.5177, 50.2367]
+// [snowsingle] Reference times:  [36.2395, 45.46, 44.4063]
+
+// Running scene: biglittle...
+// [biglittle] Correctness failed ... Check ./logs/correctness_biglittle.log
+// [biglittle] Student times:  [51.8994, 43.3548, 51.6669]
+// [biglittle] Reference times:  [21.3199, 21.3094, 21.399]
+
+// Running scene: rand1M...
+// [rand1M] Correctness failed ... Check ./logs/correctness_rand1M.log
+// [rand1M] Student times:  [306.8532, 307.9399, 307.7441]
+// [rand1M] Reference times:  [243.048, 243.6864, 244.7016]
+
+// Running scene: micro2M...
+// [micro2M] Correctness failed ... Check ./logs/correctness_micro2M.log
+// [micro2M] Student times:  [578.7175, 581.0969, 585.5918]
+// [micro2M] Reference times:  [475.9489, 478.1346, 478.3465]
+// ------------
+// Score table:
+// ------------
+// --------------------------------------------------------------------------
+// | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
+// --------------------------------------------------------------------------
+// | rgb             | 0.2714           | 0.2614          | 9               |
+// | rand10k         | 5.4061           | (F)             | 0               |
+// | rand100k        | 32.0322          | (F)             | 0               |
+// | pattern         | 0.4826           | (F)             | 0               |
+// | snowsingle      | 36.2395          | (F)             | 0               |
+// | biglittle       | 21.3094          | (F)             | 0               |
+// | rand1M          | 243.048          | (F)             | 0               |
+// | micro2M         | 475.9489         | (F)             | 0               |
+// --------------------------------------------------------------------------
+// |                                    | Total score:    | 9/72            |
+// --------------------------------------------------------------------------
