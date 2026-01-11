@@ -14,6 +14,12 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+
+#define SCAN_BLOCK_DIM   1024  // needed by sharedMemExclusiveScan implementation
+#define MAX_CIRCLES_PER_BLOCK 2048 
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -318,8 +324,8 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, bool isSnowflake) {
+    
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
@@ -335,14 +341,8 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     float alpha;
 
     // there is a non-zero contribution.  Now compute the shading value
-
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    // Scene type is now determined outside the loop to avoid redundant branching
+    if (isSnowflake) {
 
         const float kCircleMaxAlpha = .5f;
         const float falloffScale = 4.f;
@@ -397,6 +397,10 @@ __global__ void kernelRenderCircles() {
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
     float  rad = cuConstRendererParams.radius[index];
 
+    // Determine scene type once before the pixel loop to avoid redundant branching
+    bool isSnowflake = (cuConstRendererParams.sceneName == SNOWFLAKES || 
+                        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME);
+
     // compute the bounding box of the circle. The bound is in integer
     // screen coordinates, so it's clamped to the edges of the screen.
     short imageWidth = cuConstRendererParams.imageWidth;
@@ -421,10 +425,126 @@ __global__ void kernelRenderCircles() {
         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
+            shadePixel(index, pixelCenterNorm, p, imgPtr, isSnowflake);
             imgPtr++;
         }
     }
+}
+
+__device__ __inline__ int populateCircleList(int linearThreadIndex, int c, int numCircles, float blockMinX, float blockMaxX, float blockMinY, float blockMaxY, uint* prefixSumInput, uint* prefixSumOutput, uint* prefixSumScratch, uint* circleList, int& numCirclesInList){
+    int circleIndex = linearThreadIndex + c;
+    // 1. Populate circle-in-box flag
+    int isInBox = 0;
+    if (circleIndex < numCircles){
+        int index3 = 3 * circleIndex;
+        float rad = cuConstRendererParams.radius[circleIndex];
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        isInBox = circleInBox(p.x, p.y, rad, blockMinX, blockMaxX, blockMaxY, blockMinY);  
+    }
+    prefixSumInput[linearThreadIndex] = isInBox;
+    __syncthreads();
+
+    // 2. Call exclusive scan to compute prefix sum 
+    // E.g. Input:  {1, 0, 0, 1, 1, 0, 0, 0, 0, 0}
+    //.     Output: {0, 1, 1, 1, 2, 3, 3, 3, 3, 3}
+    sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+    __syncthreads();
+
+    // 3. Scatter 
+    if (isInBox) {
+        int outputIndex = prefixSumOutput[linearThreadIndex];
+        circleList[numCirclesInList + outputIndex] = circleIndex;
+    }
+    __syncthreads(); 
+    if (linearThreadIndex == 0){
+        // Since prefix sum is exclusive, need to add the last elelment in the flag array.
+        numCirclesInList += prefixSumOutput[SCAN_BLOCK_DIM - 1] + prefixSumInput[SCAN_BLOCK_DIM - 1];
+    }
+    __syncthreads(); 
+
+    if (numCirclesInList + SCAN_BLOCK_DIM > MAX_CIRCLES_PER_BLOCK) {
+        // should flush now 
+        return 1;
+    }
+    return 0;
+
+}
+
+__device__ __inline__ void renderPixel(int pixelX, int pixelY, float2 pixelCenterNorm, short imageWidth, short imageHeight, int numCirclesInList, uint* circleList, bool isSnowflake){
+    
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+    // For circles inside the box, 
+    for (int i = 0; i < numCirclesInList; i++) {
+        int index = circleList[i];
+        int index3 = 3 * index;
+
+        // read position and radius
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        
+        shadePixel(index, pixelCenterNorm, p, imgPtr, isSnowflake);
+    }
+}
+
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread renders a pixel.  
+__global__ void kernelRenderPixels() {
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;    
+    int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
+    int numCircles = cuConstRendererParams.numCircles;
+    
+    // Determine scene type once at the beginning to avoid redundant branching
+    bool isSnowflake = (cuConstRendererParams.sceneName == SNOWFLAKES || 
+                        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME);
+    
+    // Scan number of threads of elements at a time
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+    __shared__ uint circleList[MAX_CIRCLES_PER_BLOCK];
+    __shared__ int numCirclesInList;
+
+    if (linearThreadIndex == 0) {
+        numCirclesInList = 0;
+    }
+    __syncthreads();
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float blockMinX = blockIdx.x * blockDim.x * invWidth;
+    float blockMaxX = (blockIdx.x + 1) * blockDim.x * invWidth;
+    float blockMinY = blockIdx.y * blockDim.y * invHeight;
+    float blockMaxY = (blockIdx.y + 1) * blockDim.y * invHeight;
+    bool isValidPixel = (x < imageWidth && y < imageHeight);
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(x) + 0.5f),
+                                    invHeight * (static_cast<float>(y) + 0.5f));
+
+    for (int c = 0; c < numCircles; c += SCAN_BLOCK_DIM){
+        // All threads collaboratively find circle candidates
+        int shouldFlush = populateCircleList(linearThreadIndex, c, numCircles, blockMinX, blockMaxX, blockMinY, blockMaxY, prefixSumInput, prefixSumOutput, prefixSumScratch, circleList, numCirclesInList);
+        
+        // Need to process existing circles first, before finding more candidates. 
+        if (shouldFlush && isValidPixel){
+            renderPixel(x, y, pixelCenterNorm, imageWidth, imageHeight, numCirclesInList, circleList, isSnowflake);
+        }
+        __syncthreads();
+        // Last thread should empty out the circle list
+        if (shouldFlush && linearThreadIndex == 0){
+            numCirclesInList = 0;
+        }
+        __syncthreads();
+    }
+
+    // Render remaining circles after loop ends
+    if (numCirclesInList>0 and isValidPixel){
+        renderPixel(x, y, pixelCenterNorm, imageWidth, imageHeight, numCirclesInList, circleList, isSnowflake);
+    }
+    __syncthreads();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -616,7 +736,7 @@ CudaRenderer::clearImage() {
 // and velocities
 void
 CudaRenderer::advanceAnimation() {
-     // 256 threads per block is a healthy number
+    // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
@@ -636,10 +756,27 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(32, 32); // 1024 threads per block
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y
+    );
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
+
+// --------------------------------------------------------------------------
+// | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
+// --------------------------------------------------------------------------
+// | rgb             | 0.2616           | 0.2613          | 9               |
+// | rand10k         | 3.7789           | 3.8415          | 9               |
+// | rand100k        | 39.5999          | 43.1768         | 9               |
+// | pattern         | 0.5037           | 0.4225          | 9               |
+// | snowsingle      | 38.2106          | 15.2027         | 9               |
+// | biglittle       | 28.8957          | 43.1092         | 7               |
+// | rand1M          | 246.1993         | 99.6047         | 9               |
+// | micro2M         | 478.1323         | 160.1529        | 9               |
+// --------------------------------------------------------------------------
+// |                                    | Total score:    | 70/72           |
+// --------------------------------------------------------------------------
